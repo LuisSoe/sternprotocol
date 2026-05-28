@@ -1,0 +1,25 @@
+{
+  "name": "stern-protocol",
+  "version": "0.1.0",
+  "private": true,
+  "description": "STERN Protocol smart escrow MVP for export-import settlement.",
+  "scripts": {
+    "compile": "hardhat compile",
+    "test": "hardhat test",
+    "deploy:local": "hardhat run scripts/deploy.js --network localhost",
+    "mine:128": "hardhat run scripts/mine-blocks.js --network localhost",
+    "backend": "node backend/oracle-gateway/index.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "ethers": "^6.13.5",
+    "express": "^4.21.2"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^5.0.0",
+    "@openzeppelin/contracts": "^5.2.0",
+    "hardhat": "^2.26.0",
+    "pdf-parse": "^2.4.5"
+  }
+}
