@@ -8,10 +8,10 @@ describe("SternEscrow", function () {
   const commodity = "Indonesian coffee";
   const containerRef = "TGHU-2026-001";
 
-  async function deployFixture() {
+  async function deployFixture(confirmations = 128) {
     const [owner, oracle, importer, exporter, arbiter, outsider] = await ethers.getSigners();
     const SternEscrow = await ethers.getContractFactory("SternEscrow");
-    const sternEscrow = await SternEscrow.deploy(owner.address, oracle.address);
+    const sternEscrow = await SternEscrow.deploy(owner.address, oracle.address, confirmations);
     await sternEscrow.waitForDeployment();
     return { sternEscrow, owner, oracle, importer, exporter, arbiter, outsider };
   }
@@ -41,7 +41,7 @@ describe("SternEscrow", function () {
     await mine(128);
 
     await expect(
-      ctx.sternEscrow.connect(ctx.oracle).submitVerification(escrowId, true, true, true, true)
+      ctx.sternEscrow.connect(ctx.oracle).submitVerification(escrowId, true, true, true, true, true)
     )
       .to.emit(ctx.sternEscrow, "FundsReleased")
       .withArgs(escrowId, ctx.exporter.address, value)
@@ -58,7 +58,7 @@ describe("SternEscrow", function () {
     const { escrowId } = await createEscrow(ctx);
 
     await expect(
-      ctx.sternEscrow.connect(ctx.outsider).submitVerification(escrowId, true, true, true, true)
+      ctx.sternEscrow.connect(ctx.outsider).submitVerification(escrowId, true, true, true, true, true)
     ).to.be.revertedWith("not trusted oracle");
   });
 
@@ -67,7 +67,7 @@ describe("SternEscrow", function () {
     const { escrowId } = await createEscrow(ctx);
 
     await mine(128);
-    await ctx.sternEscrow.connect(ctx.oracle).submitVerification(escrowId, false, true, true, true);
+    await ctx.sternEscrow.connect(ctx.oracle).submitVerification(escrowId, false, true, true, true, true);
 
     await expect(ctx.sternEscrow.connect(ctx.importer).releaseEscrow(escrowId)).to.be.revertedWith(
       "conditions not met"
@@ -77,11 +77,27 @@ describe("SternEscrow", function () {
     expect(escrow.state).to.equal(0);
   });
 
+  it("does not release when inspection fails", async function () {
+    const ctx = await deployFixture();
+    const { escrowId } = await createEscrow(ctx);
+
+    await mine(128);
+    await ctx.sternEscrow.connect(ctx.oracle).submitVerification(escrowId, true, true, true, true, false);
+
+    await expect(ctx.sternEscrow.connect(ctx.importer).releaseEscrow(escrowId)).to.be.revertedWith(
+      "conditions not met"
+    );
+
+    const escrow = await ctx.sternEscrow.getEscrow(escrowId);
+    expect(escrow.state).to.equal(0);
+    expect(escrow.verification.inspectionPassed).to.equal(false);
+  });
+
   it("allows 2-of-3 disputed refund approval", async function () {
     const ctx = await deployFixture();
     const { escrowId } = await createEscrow(ctx);
 
-    await ctx.sternEscrow.connect(ctx.oracle).submitVerification(escrowId, false, true, true, true);
+    await ctx.sternEscrow.connect(ctx.oracle).submitVerification(escrowId, false, true, true, true, true);
     await expect(ctx.sternEscrow.connect(ctx.exporter).openDispute(escrowId))
       .to.emit(ctx.sternEscrow, "DisputeOpened")
       .withArgs(escrowId, ctx.exporter.address);
@@ -118,7 +134,7 @@ describe("SternEscrow", function () {
     const { escrowId } = await createEscrow(ctx);
 
     await mine(128);
-    await ctx.sternEscrow.connect(ctx.oracle).submitVerification(escrowId, true, true, true, true);
+    await ctx.sternEscrow.connect(ctx.oracle).submitVerification(escrowId, true, true, true, true, true);
 
     await expect(ctx.sternEscrow.connect(ctx.importer).releaseEscrow(escrowId)).to.be.revertedWith(
       "escrow already completed"
@@ -135,5 +151,77 @@ describe("SternEscrow", function () {
     await expect(
       ctx.sternEscrow.connect(ctx.importer).voteDisputeResolution(escrowId, false)
     ).to.be.revertedWith("already voted");
+  });
+
+  it("respects the configured confirmation depth", async function () {
+    const ctx = await deployFixture(5);
+    const { escrowId } = await createEscrow(ctx);
+
+    await ctx.sternEscrow.connect(ctx.oracle).submitVerification(escrowId, true, true, true, true, true);
+
+    let escrow = await ctx.sternEscrow.getEscrow(escrowId);
+    expect(escrow.state).to.equal(1); // Verified, but not yet deep enough to auto-release
+
+    await mine(5);
+    await ctx.sternEscrow.connect(ctx.importer).releaseEscrow(escrowId);
+
+    escrow = await ctx.sternEscrow.getEscrow(escrowId);
+    expect(escrow.state).to.equal(2);
+    expect(await ctx.sternEscrow.requiredConfirmations()).to.equal(5);
+  });
+
+  it("rejects deployment with zero confirmations", async function () {
+    const [owner, oracle] = await ethers.getSigners();
+    const SternEscrow = await ethers.getContractFactory("SternEscrow");
+    await expect(SternEscrow.deploy(owner.address, oracle.address, 0)).to.be.revertedWith(
+      "confirmations required"
+    );
+  });
+
+  it("extends the deadline when proposer and counterparty both sign", async function () {
+    const ctx = await deployFixture();
+    const { escrowId, deadline } = await createEscrow(ctx);
+    const newDeadline = deadline + 3 * 24 * 60 * 60;
+
+    await expect(ctx.sternEscrow.connect(ctx.exporter).proposeDeadlineExtension(escrowId, newDeadline))
+      .to.emit(ctx.sternEscrow, "DeadlineExtensionProposed")
+      .withArgs(escrowId, ctx.exporter.address, newDeadline);
+
+    await expect(ctx.sternEscrow.connect(ctx.importer).approveDeadlineExtension(escrowId))
+      .to.emit(ctx.sternEscrow, "DeadlineExtended")
+      .withArgs(escrowId, newDeadline);
+
+    const escrow = await ctx.sternEscrow.getEscrow(escrowId);
+    expect(escrow.deadline).to.equal(newDeadline);
+    expect(await ctx.sternEscrow.pendingDeadline(escrowId)).to.equal(0);
+  });
+
+  it("prevents the proposer from approving their own extension", async function () {
+    const ctx = await deployFixture();
+    const { escrowId, deadline } = await createEscrow(ctx);
+    const newDeadline = deadline + 3 * 24 * 60 * 60;
+
+    await ctx.sternEscrow.connect(ctx.exporter).proposeDeadlineExtension(escrowId, newDeadline);
+
+    await expect(
+      ctx.sternEscrow.connect(ctx.exporter).approveDeadlineExtension(escrowId)
+    ).to.be.revertedWith("proposer cannot approve");
+  });
+
+  it("rejects extension proposals from non-parties and shorter deadlines", async function () {
+    const ctx = await deployFixture();
+    const { escrowId, deadline } = await createEscrow(ctx);
+
+    await expect(
+      ctx.sternEscrow.connect(ctx.outsider).proposeDeadlineExtension(escrowId, deadline + 1000)
+    ).to.be.revertedWith("only importer or exporter");
+
+    await expect(
+      ctx.sternEscrow.connect(ctx.exporter).proposeDeadlineExtension(escrowId, deadline - 1000)
+    ).to.be.revertedWith("must extend deadline");
+
+    await expect(
+      ctx.sternEscrow.connect(ctx.importer).approveDeadlineExtension(escrowId)
+    ).to.be.revertedWith("no pending extension");
   });
 });

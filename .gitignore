@@ -16,10 +16,17 @@ frontend/.vite/
 
 .playwright-mcp/
 .codex/
+.claude/
+.mcp.json
 *.log
 cache.zip
 stern-dashboard.png
 *.pdf
+
+# internal working docs — not part of the shipped code
+CLAUDE.md
+DEMO_FILL_EXAMPLE.md
+docs/
 
 .DS_Store
 Thumbs.db

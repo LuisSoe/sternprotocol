@@ -25,13 +25,15 @@ SternEscrow
   -> Pending -> Verified -> Completed
   -> Pending -> Refunded
   -> Pending/Verified -> Disputed -> Completed/Refunded
-  -> releases funds to exporter after all checks and 128 blocks
+  -> releases funds to exporter after all checks and the configured confirmation depth
   -> emits e-BL transfer event to importer
 
-React dashboard
-  -> dashboard metrics
-  -> create escrow flow
-  -> settlement and dispute controls
+React dashboard (sidebar workspace)
+  -> escrow registry + portfolio stats
+  -> validated escrow creation (e-BL file hashed locally into a CID)
+  -> escrow workspace: lifecycle, five oracle checks + conformance harness,
+     role-gated actions, dispute voting, deadline amendment, activity log
+  -> actor session switcher (importer / exporter / arbiter) + oracle gateway status
 ```
 
 ## Folder Structure
@@ -190,35 +192,32 @@ npm run dev
 http://127.0.0.1:5173
 ```
 
-5. Go to **Dashboard** and show:
+5. The **Escrows** view shows portfolio stats and the escrow table (empty at first — no fake data).
 
-- active escrow balance
-- active contract count
-- settled value
-- VGM, AIS, CEISA, and e-BL status rails
+6. Open **New escrow** (sidebar) and fill:
 
-6. Go to **Create** and fill:
-
-- exporter wallet
-- arbiter wallet
+- exporter wallet (any valid address)
+- arbiter wallet (must differ from the exporter)
 - contract value
 - commodity
 - container reference
-- deadline
-- e-BL file name
+- deadline (at least 1 hour in the future)
 
-7. Click **Mock upload**. The app generates a fake IPFS CID.
+Every field is validated inline.
 
-8. Click **Create escrow**. Without a wallet contract address, the app creates a local mock escrow state for the demo.
+7. Attach any real file as the **e-BL document**. The app hashes it locally with SHA-256 and shows the resulting content identifier (CID).
 
-9. Go to **Settlement**.
+8. Click **Lock funds in escrow**. Without a wallet/contract address, the app creates local mock escrow state and opens the escrow workspace.
 
-10. Click **Refresh mock feed**. The dashboard calls the backend mock oracle and shows:
+9. In the workspace, click **Refresh oracle feed**. The five checks move from *unchecked* to *attested*:
 
-- VGM checked
-- AIS departed
-- CEISA approved
-- e-BL CID valid
+- VGM match
+- Vessel departed (AIS)
+- Customs approved (CEISA)
+- e-BL hash valid
+- Inspection passed (PSI surveyor)
+
+10. Use the **conformance harness** toggles to flip any check to failure, refresh, and submit — funds stay locked. Switch actors via the session card at the bottom of the sidebar to walk the dispute (2-of-3 votes) and deadline-amendment flows.
 
 This is enough for a UI/product demo.
 
@@ -281,15 +280,15 @@ npm run dev
 
 10. Create an escrow. The contract value is paid in local dummy ETH from the imported Hardhat account.
 
-11. Mine 128 blocks before release eligibility:
+11. (Usually unnecessary) The local deploy uses a confirmation depth of 5 blocks. If you deployed with a higher `REQUIRED_CONFIRMATIONS`, mine blocks:
 
 ```bash
 npm run mine:128
 ```
 
-12. In the Settlement screen, click **Submit oracle verification**.
+12. Open the escrow from the **Escrows** table and click **Submit verification** in the workspace.
 
-13. If all checks are true and 128 blocks have passed, the contract releases funds to the exporter and emits the e-BL transfer event.
+13. If all checks are true and the confirmation depth has passed, the contract releases funds to the exporter and emits the e-BL transfer event.
 
 ### Do You Need a Wallet?
 
@@ -301,27 +300,45 @@ The MVP uses local Hardhat ETH as dummy value. It is not a custom ERC20 token an
 
 ## Mock APIs
 
-The MVP uses deterministic mocks:
+The MVP uses deterministic mocks shaped like the real API responses ("we mock the credentials, not the architecture"):
 
 - `vgm-mock.js`: container VGM, expected VGM, match status, gate-in status, Tanjung Priok port.
 - `ais-mock.js`: vessel IMO and `departed` status.
 - `ceisa-mock.js`: PEB number and `approved` customs status.
-- `ipfs-mock.js`: mock upload and CID validity.
+- `ipfs-mock.js`: CID validity check (the CID itself is a real SHA-256 hash of the file you attach in the UI).
+- `inspection-mock.js`: PSI surveyor certificate (Sucofindo) and `passed` status.
 
-These are structured so real integrations can replace them later without changing the contract interface.
+Each mock is an adapter that a real integration can replace without changing the contract interface. Every check can be flipped per-request via query/body overrides — the UI's conformance-harness toggles use exactly that.
 
 ## Proposal PDF Check
 
-The included proposal describes the same STERN concept: Polygon/Layer-2 smart escrow, e-BL CID on IPFS, VGM/AIS/CEISA verification, 128-block finality, and 2-of-3 dispute governance. This implementation is aligned with the PDF and is stronger as an MVP because it includes a runnable Hardhat test suite, backend oracle gateway, deterministic mocks, and a buildable React dashboard.
+The included proposal describes the same STERN concept: Polygon/Layer-2 smart escrow, e-BL CID on IPFS, VGM/AIS/CEISA verification, confirmation-depth finality safeguards, and 2-of-3 dispute governance. This implementation is aligned with the PDF and is stronger as an MVP because it includes a runnable Hardhat test suite, backend oracle gateway, deterministic mocks, and a buildable React dashboard.
 
 ## Validation
 
 Current local validation:
 
 ```text
-npx hardhat test: 7 passing
+npx hardhat test: 13 passing
 frontend npm run build: passed
 ```
+
+## Deploying the Frontend to Vercel
+
+The frontend is a static Vite build and deploys straight from GitHub:
+
+1. In Vercel: **Add New Project** -> import this repository.
+2. Set **Root Directory** to `frontend` (framework preset: Vite).
+3. Add environment variables when you have a public deployment:
+
+```text
+VITE_CONTRACT_ADDRESS=your_amoy_contract_address
+VITE_ORACLE_API=https://your-gateway-host
+```
+
+Without them, the deployed app runs in mock-session mode — which is a complete demo by itself.
+
+The oracle gateway is a persistent Express server; host it on Render/Railway (build `npm install`, start `node backend/oracle-gateway/index.js`, plus the `RPC_URL` / `ORACLE_PRIVATE_KEY` / `CONTRACT_ADDRESS` env vars). The contract itself deploys to Polygon Amoy via `npx hardhat run scripts/deploy.js --network amoy` (requires `AMOY_RPC_URL` and `DEPLOYER_PRIVATE_KEY` in `.env`).
 
 ## Production Roadmap
 

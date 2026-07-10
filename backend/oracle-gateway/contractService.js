@@ -33,7 +33,8 @@ async function submitOracleVerification(contractId, verification) {
     verification.vgmMatch,
     verification.aisDeparted,
     verification.ceisaApproved,
-    verification.eblCidValid
+    verification.eblCidValid,
+    verification.inspectionPassed
   );
   const receipt = await tx.wait();
   return { transactionHash: receipt.hash, blockNumber: receipt.blockNumber };

@@ -21,6 +21,7 @@ module.exports = {
     },
     amoy: {
       url: process.env.AMOY_RPC_URL || "",
+      chainId: 80002,
       accounts: process.env.DEPLOYER_PRIVATE_KEY ? [process.env.DEPLOYER_PRIVATE_KEY] : []
     }
   }

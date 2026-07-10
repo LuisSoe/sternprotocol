@@ -15,8 +15,32 @@ async function request(path, options) {
   return payload;
 }
 
-export function getMockStatus(contractId) {
-  return request(`/mock-status/${contractId}`);
+function toOverrideQuery(overrides = {}) {
+  const params = new URLSearchParams();
+
+  Object.entries(overrides).forEach(([key, value]) => {
+    if (value === undefined || value === null) return;
+
+    if (typeof value === "object") {
+      Object.entries(value).forEach(([subKey, subValue]) => {
+        if (subValue === undefined || subValue === null) return;
+        params.append(`${key}[${subKey}]`, subValue);
+      });
+    } else {
+      params.append(key, value);
+    }
+  });
+
+  const query = params.toString();
+  return query ? `?${query}` : "";
+}
+
+export function getHealth() {
+  return request("/health");
+}
+
+export function getMockStatus(contractId, overrides) {
+  return request(`/mock-status/${contractId}${toOverrideQuery(overrides)}`);
 }
 
 export function submitOracle(contractId, body) {

@@ -19,6 +19,7 @@ contract SternEscrow is Ownable, Pausable, ReentrancyGuard {
         bool aisDeparted;
         bool ceisaApproved;
         bool eblCidValid;
+        bool inspectionPassed;
         uint256 submittedAtBlock;
     }
 
@@ -38,13 +39,18 @@ contract SternEscrow is Ownable, Pausable, ReentrancyGuard {
         uint8 refundApprovals;
     }
 
-    uint256 public constant REQUIRED_CONFIRMATIONS = 128;
+    // Confirmation depth before release, set once at deployment. Polygon PoS has
+    // ~5s deterministic finality since Heimdall v2; this acts as an optional
+    // circuit-breaker for finality-lag incidents, not the primary finality source.
+    uint256 public immutable requiredConfirmations;
 
     address public trustedOracle;
     uint256 public nextEscrowId;
 
     mapping(uint256 => Escrow) private escrows;
     mapping(uint256 => mapping(address => bool)) public disputeVoted;
+    mapping(uint256 => uint256) public pendingDeadline;
+    mapping(uint256 => address) public extensionProposer;
 
     event TrustedOracleUpdated(address indexed oldOracle, address indexed newOracle);
     event EscrowCreated(
@@ -63,8 +69,11 @@ contract SternEscrow is Ownable, Pausable, ReentrancyGuard {
         bool vgmMatch,
         bool aisDeparted,
         bool ceisaApproved,
-        bool eblCidValid
+        bool eblCidValid,
+        bool inspectionPassed
     );
+    event DeadlineExtensionProposed(uint256 indexed escrowId, address indexed proposer, uint256 newDeadline);
+    event DeadlineExtended(uint256 indexed escrowId, uint256 newDeadline);
     event FundsReleased(uint256 indexed escrowId, address indexed exporter, uint256 amount);
     event Refunded(uint256 indexed escrowId, address indexed importer, uint256 amount);
     event DisputeOpened(uint256 indexed escrowId, address indexed openedBy);
@@ -82,10 +91,12 @@ contract SternEscrow is Ownable, Pausable, ReentrancyGuard {
         _;
     }
 
-    constructor(address initialOwner, address initialOracle) Ownable(initialOwner) {
+    constructor(address initialOwner, address initialOracle, uint256 confirmations) Ownable(initialOwner) {
         require(initialOwner != address(0), "owner zero address");
         require(initialOracle != address(0), "oracle zero address");
+        require(confirmations > 0, "confirmations required");
         trustedOracle = initialOracle;
+        requiredConfirmations = confirmations;
     }
 
     function createEscrow(
@@ -120,6 +131,7 @@ contract SternEscrow is Ownable, Pausable, ReentrancyGuard {
                 aisDeparted: false,
                 ceisaApproved: false,
                 eblCidValid: false,
+                inspectionPassed: false,
                 submittedAtBlock: 0
             }),
             releaseApprovals: 0,
@@ -144,7 +156,8 @@ contract SternEscrow is Ownable, Pausable, ReentrancyGuard {
         bool vgmMatch,
         bool aisDeparted,
         bool ceisaApproved,
-        bool eblCidValid
+        bool eblCidValid,
+        bool inspectionPassed
     ) external onlyOracle whenNotPaused escrowExists(escrowId) {
         Escrow storage escrow = escrows[escrowId];
         require(escrow.state == State.Pending || escrow.state == State.Verified, "escrow not verifiable");
@@ -154,10 +167,11 @@ contract SternEscrow is Ownable, Pausable, ReentrancyGuard {
             aisDeparted: aisDeparted,
             ceisaApproved: ceisaApproved,
             eblCidValid: eblCidValid,
+            inspectionPassed: inspectionPassed,
             submittedAtBlock: block.number
         });
 
-        emit OracleVerificationSubmitted(escrowId, vgmMatch, aisDeparted, ceisaApproved, eblCidValid);
+        emit OracleVerificationSubmitted(escrowId, vgmMatch, aisDeparted, ceisaApproved, eblCidValid, inspectionPassed);
 
         if (_allConditionsMet(escrow) && escrow.state == State.Pending) {
             escrow.state = State.Verified;
@@ -234,6 +248,42 @@ contract SternEscrow is Ownable, Pausable, ReentrancyGuard {
         }
     }
 
+    function proposeDeadlineExtension(uint256 escrowId, uint256 newDeadline)
+        external
+        whenNotPaused
+        escrowExists(escrowId)
+    {
+        Escrow storage escrow = escrows[escrowId];
+        require(escrow.state == State.Pending || escrow.state == State.Verified, "escrow not amendable");
+        require(
+            msg.sender == escrow.importerAddress || msg.sender == escrow.exporterAddress,
+            "only importer or exporter"
+        );
+        require(newDeadline > escrow.deadline, "must extend deadline");
+
+        pendingDeadline[escrowId] = newDeadline;
+        extensionProposer[escrowId] = msg.sender;
+        emit DeadlineExtensionProposed(escrowId, msg.sender, newDeadline);
+    }
+
+    function approveDeadlineExtension(uint256 escrowId) external whenNotPaused escrowExists(escrowId) {
+        Escrow storage escrow = escrows[escrowId];
+        require(escrow.state == State.Pending || escrow.state == State.Verified, "escrow not amendable");
+        require(
+            msg.sender == escrow.importerAddress || msg.sender == escrow.exporterAddress,
+            "only importer or exporter"
+        );
+
+        uint256 newDeadline = pendingDeadline[escrowId];
+        require(newDeadline != 0, "no pending extension");
+        require(msg.sender != extensionProposer[escrowId], "proposer cannot approve");
+
+        escrow.deadline = newDeadline;
+        delete pendingDeadline[escrowId];
+        delete extensionProposer[escrowId];
+        emit DeadlineExtended(escrowId, newDeadline);
+    }
+
     function setTrustedOracle(address newOracle) external onlyOwner {
         require(newOracle != address(0), "oracle zero address");
         address oldOracle = trustedOracle;
@@ -289,7 +339,7 @@ contract SternEscrow is Ownable, Pausable, ReentrancyGuard {
     }
 
     function _isReleaseEligible(Escrow storage escrow) private view returns (bool) {
-        return _allConditionsMet(escrow) && block.number >= escrow.createdBlock + REQUIRED_CONFIRMATIONS;
+        return _allConditionsMet(escrow) && block.number >= escrow.createdBlock + requiredConfirmations;
     }
 
     function _allConditionsMet(Escrow storage escrow) private view returns (bool) {
@@ -297,7 +347,8 @@ contract SternEscrow is Ownable, Pausable, ReentrancyGuard {
         return verification.vgmMatch
             && verification.aisDeparted
             && verification.ceisaApproved
-            && verification.eblCidValid;
+            && verification.eblCidValid
+            && verification.inspectionPassed;
     }
 
     function _isParty(Escrow storage escrow, address account) private view returns (bool) {
