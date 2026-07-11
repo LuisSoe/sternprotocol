@@ -121,10 +121,21 @@ export default function EscrowDetail({ escrow, role, isOnChainReady, onUpdate, o
 
   function surfaceTxError(error) {
     const reason = error.reason || error.shortMessage || error.message || "Transaction failed";
-    const nonceHint = /nonce|already known|replacement/i.test(reason)
-      ? " Hardhat node restarted? Clear MetaMask nonce cache: Settings → Advanced → Clear activity tab data."
-      : "";
-    fail(`${reason}.${nonceHint}`);
+    let hint = "";
+    if (/nonce|already known|replacement/i.test(reason)) {
+      hint = " Hardhat node restarted? Clear MetaMask nonce cache: Settings → Advanced → Clear activity tab data.";
+    } else if (/escrow not found/i.test(reason)) {
+      hint =
+        " This escrow ID does not exist on the connected contract — the node was probably restarted or CONTRACT_ADDRESS points at a different deployment. Redeploy, update both .env files, and create the escrow again.";
+    } else if (/already completed/i.test(reason)) {
+      hint =
+        " Funds were already released to the exporter — release also happens automatically inside the oracle's submit once all checks pass and the confirmation depth is reached.";
+    } else if (/conditions not met/i.test(reason)) {
+      hint = " All five checks must be attested on-chain and the confirmation depth reached.";
+    } else if (/deadline not passed/i.test(reason)) {
+      hint = " Refund only opens after the escrow deadline.";
+    }
+    fail(`${reason}.${hint}`);
   }
 
   function buildOverrides() {
@@ -144,6 +155,9 @@ export default function EscrowDetail({ escrow, role, isOnChainReady, onUpdate, o
       await action();
     } catch (error) {
       surfaceTxError(error);
+      // After a failed on-chain action, re-read the contract so the UI shows
+      // the true state (e.g. an escrow that auto-released during submit).
+      if (isChain) await syncChain().catch(() => {});
     } finally {
       setBusy(false);
     }
@@ -171,7 +185,17 @@ export default function EscrowDetail({ escrow, role, isOnChainReady, onUpdate, o
       ok(`Verification submitted on-chain (tx ${result.result.transactionHash.slice(0, 10)}…).`);
       log("submitted oracle verification on-chain");
     } catch (error) {
-      // Gateway unreachable or chain env missing: evaluate the same feed locally.
+      if (isChain) {
+        // Wallet mode: verification MUST land on-chain. Never pretend with
+        // local mock state — surface the failure and re-read the contract.
+        await syncChain().catch(() => {});
+        fail(
+          `Oracle gateway request failed: ${error.message}. In wallet mode the oracle must submit on-chain — make sure the gateway is running (npm run backend) and its .env points at this contract, then submit again.`
+        );
+        return;
+      }
+
+      // Mock session: evaluate the same feed locally.
       const status = await getMockStatus(escrow.id, overrides);
       setOracleSources(status.sources);
       onUpdate(escrow.id, (current) => ({
@@ -625,6 +649,11 @@ export default function EscrowDetail({ escrow, role, isOnChainReady, onUpdate, o
               <Scale size={13} aria-hidden="true" />
               Open dispute
             </button>
+            <p className="pt-1 text-2xs text-paper-faint">
+              Release pays the <span className="text-paper-dim">exporter</span>. Refund returns funds
+              to the <span className="text-paper-dim">importer</span> (importer only, after the
+              deadline). Dispute freezes funds for a 2-of-3 vote.
+            </p>
             {isChain ? (
               <p className="pt-1 text-2xs text-paper-faint">
                 Wallet mode: switch MetaMask to the {role} account before acting.
