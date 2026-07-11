@@ -17,9 +17,10 @@ Mock logistics/customs data
   -> CEISA customs approval mock
   -> IPFS CID validity mock
 
-Oracle gateway
-  -> aggregates mock data
-  -> submits verification as trusted oracle
+Oracle consortium (2-of-3, bond-secured)
+  -> gateway relays one attestation per consortium member
+  -> contract computes majority consensus on-chain
+  -> deviating oracles are slashed 50% of their bond automatically
 
 SternEscrow
   -> Pending -> Verified -> Completed
@@ -102,7 +103,7 @@ Deploy to local node in a second terminal:
 npm run deploy:local
 ```
 
-Set `CONTRACT_ADDRESS`, `RPC_URL`, and `ORACLE_PRIVATE_KEY` in `.env` using one of the local Hardhat private keys.
+Set `CONTRACT_ADDRESS`, `RPC_URL`, and `ORACLE_PRIVATE_KEYS` in `.env`. The deploy script registers Hardhat accounts #1, #4, and #5 as the oracle consortium and posts their bonds — use those three private keys, comma-separated.
 
 ## Backend Oracle Gateway
 
@@ -126,7 +127,7 @@ Required env vars for on-chain actions:
 
 ```text
 RPC_URL
-ORACLE_PRIVATE_KEY
+ORACLE_PRIVATE_KEYS   (comma-separated consortium keys; single ORACLE_PRIVATE_KEY also works)
 CONTRACT_ADDRESS
 ```
 
@@ -319,7 +320,7 @@ The included proposal describes the same STERN concept: Polygon/Layer-2 smart es
 Current local validation:
 
 ```text
-npx hardhat test: 13 passing
+npx hardhat test: 16 passing
 frontend npm run build: passed
 ```
 

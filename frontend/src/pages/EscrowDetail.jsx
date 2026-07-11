@@ -17,6 +17,8 @@ import { inputClass } from "../components/Field.jsx";
 import { getMockStatus, submitOracle } from "../lib/api.js";
 import { getBrowserContract } from "../lib/contract.js";
 import { CURRENCY_LABEL } from "../lib/currency.js";
+import { CONSORTIUM, ORACLE_QUORUM, defaultConsortium } from "../lib/oracles.js";
+import { shortAddress } from "../lib/actors.js";
 
 const STATE_LABELS = ["Pending", "Verified", "Completed", "Refunded", "Disputed"];
 
@@ -36,16 +38,19 @@ const PERMISSIONS = {
 
 export default function EscrowDetail({ escrow, role, isOnChainReady, onUpdate, onBack }) {
   const [checks, setChecks] = useState({ vgm: true, ais: true, ceisa: true, ebl: true, inspection: true });
+  const [dissentIndex, setDissentIndex] = useState(null);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState(null);
   const [oracleSources, setOracleSources] = useState(null);
   const [extensionInput, setExtensionInput] = useState("");
   const [chainMeta, setChainMeta] = useState(null);
+  const [chainOracles, setChainOracles] = useState(null);
 
   const permissions = PERMISSIONS[role] || PERMISSIONS.importer;
   const isChain = isOnChainReady && escrow.source === "chain";
   const verification = escrow.verification;
   const deadlinePassed = escrow.deadline ? Date.now() > new Date(escrow.deadline).getTime() : false;
+  const consortium = isChain ? chainOracles || [] : escrow.consortium || defaultConsortium();
 
   const grossValue = Number(escrow.value) || 0;
   const platformFee = grossValue * 0.005;
@@ -53,6 +58,8 @@ export default function EscrowDetail({ escrow, role, isOnChainReady, onUpdate, o
   useEffect(() => {
     setMessage(null);
     setOracleSources(null);
+    setChainOracles(null);
+    setDissentIndex(null);
     if (!isChain) return;
 
     (async () => {
@@ -65,12 +72,39 @@ export default function EscrowDetail({ escrow, role, isOnChainReady, onUpdate, o
         ]);
         setChainMeta({ confirmations: Number(confirmations), eligible });
         applyChainEscrow(chainEscrow);
+        await loadChainOracles(contract);
       } catch {
         setChainMeta(null);
       }
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [escrow.id, isChain]);
+
+  async function loadChainOracles(contract) {
+    try {
+      const [addrs, bonds, slashes] = await contract.getOracles();
+      const rows = await Promise.all(
+        addrs.map(async (address, index) => {
+          const [attestation, wasSlashed] = await Promise.all([
+            contract.getAttestation(escrow.id, address),
+            contract.slashedFor(escrow.id, address)
+          ]);
+          return {
+            address,
+            name: CONSORTIUM[index]?.name || `Oracle ${index + 1}`,
+            descr: CONSORTIUM[index]?.descr || "",
+            bond: Number(bonds[index]) / 1e18,
+            slashes: Number(slashes[index]),
+            attested: attestation.submitted,
+            slashed: wasSlashed
+          };
+        })
+      );
+      setChainOracles(rows);
+    } catch {
+      setChainOracles(null);
+    }
+  }
 
   function applyChainEscrow(chainEscrow) {
     const state = STATE_LABELS[Number(chainEscrow.state)] || "Pending";
@@ -102,6 +136,7 @@ export default function EscrowDetail({ escrow, role, isOnChainReady, onUpdate, o
     ]);
     applyChainEscrow(chainEscrow);
     setChainMeta((meta) => (meta ? { ...meta, eligible } : meta));
+    await loadChainOracles(contract);
   }
 
   function log(event) {
@@ -175,15 +210,44 @@ export default function EscrowDetail({ escrow, role, isOnChainReady, onUpdate, o
     log("refreshed the oracle feed");
   }
 
+  function applyMockConsortium(current) {
+    const base = current.consortium || defaultConsortium();
+    return base.map((member, index) => {
+      if (index === dissentIndex) {
+        return {
+          ...member,
+          attested: true,
+          slashed: true,
+          bond: member.slashed ? member.bond : member.bond / 2,
+          slashes: member.slashed ? member.slashes : member.slashes + 1
+        };
+      }
+      return { ...member, attested: true };
+    });
+  }
+
   async function submitVerification() {
     const overrides = buildOverrides();
+    const dissenterName = dissentIndex !== null ? CONSORTIUM[dissentIndex]?.name : null;
+
     try {
-      const result = await submitOracle(escrow.id, overrides);
+      const result = await submitOracle(escrow.id, {
+        ...overrides,
+        ...(dissentIndex !== null ? { dissentIndex } : {})
+      });
       setOracleSources(result.status.sources);
       onUpdate(escrow.id, (current) => ({ ...current, verification: result.status.verification }));
       await syncChain();
-      ok(`Verification submitted on-chain (tx ${result.result.transactionHash.slice(0, 10)}…).`);
-      log("submitted oracle verification on-chain");
+      const count = result.result.attestations?.length || 1;
+      if (dissenterName) {
+        ok(
+          `${count} attestations submitted on-chain. ${dissenterName} deviated from the ${ORACLE_QUORUM}-of-${CONSORTIUM.length} consensus and was slashed 50% of its bond.`
+        );
+        log(`submitted ${count} oracle attestations — ${dissenterName} deviated and was slashed`);
+      } else {
+        ok(`${count} oracle attestations submitted on-chain — consensus recorded (tx ${result.result.transactionHash.slice(0, 10)}…).`);
+        log(`submitted ${count} oracle attestations on-chain`);
+      }
     } catch (error) {
       if (isChain) {
         // Wallet mode: verification MUST land on-chain. Never pretend with
@@ -201,14 +265,26 @@ export default function EscrowDetail({ escrow, role, isOnChainReady, onUpdate, o
       onUpdate(escrow.id, (current) => ({
         ...current,
         verification: status.verification,
-        state: status.allVerified && current.state === "Pending" ? "Verified" : current.state
+        state: status.allVerified && current.state === "Pending" ? "Verified" : current.state,
+        consortium: applyMockConsortium(current)
       }));
+
+      if (dissenterName) {
+        log(`consortium consensus reached — ${dissenterName} deviated and was slashed 50% of its bond`);
+      }
       if (status.allVerified) {
-        ok("All five checks passed — escrow marked Verified (mock session).");
-        log("submitted verification: all checks passed (mock)");
+        ok(
+          dissenterName
+            ? `Consensus ${ORACLE_QUORUM}-of-${CONSORTIUM.length} reached despite ${dissenterName} deviating — dissenter slashed, escrow marked Verified (mock session).`
+            : "All five checks passed by consortium consensus — escrow marked Verified (mock session)."
+        );
+        log("submitted attestations: consensus passed (mock)");
       } else {
-        setMessage({ tone: "warn", text: "Verification recorded, but checks failed — funds stay locked." });
-        log("submitted verification: checks failed, funds locked (mock)");
+        setMessage({
+          tone: "warn",
+          text: "Consortium consensus recorded a failing check — funds stay locked."
+        });
+        log("submitted attestations: consensus failed, funds locked (mock)");
       }
     }
   }
@@ -551,6 +627,46 @@ export default function EscrowDetail({ escrow, role, isOnChainReady, onUpdate, o
               </tbody>
             </table>
 
+            <div className="border-t border-ink-700 px-3.5 py-3">
+              <div className="mb-2 flex items-center justify-between gap-2">
+                <p className="text-2xs font-semibold uppercase tracking-widest text-paper-dim">
+                  Oracle consortium · {ORACLE_QUORUM}-of-{CONSORTIUM.length} consensus
+                </p>
+                <span className="font-mono text-2xs text-paper-faint">bond-secured</span>
+              </div>
+              <ul className="grid gap-1.5 sm:grid-cols-3">
+                {consortium.map((member) => (
+                  <li
+                    key={member.address || member.name}
+                    className={`rounded border px-2.5 py-2 ${
+                      member.slashed ? "border-state-fail/50 bg-state-fail/5" : "border-ink-700"
+                    }`}
+                  >
+                    <p className="text-xs font-medium text-paper">{member.name}</p>
+                    <p className="truncate font-mono text-2xs text-paper-faint">
+                      {member.address ? shortAddress(member.address) : member.descr}
+                    </p>
+                    <div className="mt-1 flex items-center justify-between gap-2">
+                      <span className="font-mono text-2xs text-paper-dim">
+                        bond {Number(member.bond).toFixed(2)}
+                      </span>
+                      <span
+                        className={`font-mono text-2xs uppercase tracking-wider ${
+                          member.slashed
+                            ? "text-state-fail"
+                            : member.attested
+                              ? "text-state-ok"
+                              : "text-paper-faint"
+                        }`}
+                      >
+                        {member.slashed ? "slashed" : member.attested ? "attested" : "pending"}
+                      </span>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            </div>
+
             <div className="border-t border-ink-700 bg-ink-850 px-3.5 py-3">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <div>
@@ -580,6 +696,38 @@ export default function EscrowDetail({ escrow, role, isOnChainReady, onUpdate, o
                     </button>
                   ))}
                 </div>
+              </div>
+
+              <div className="mt-2.5 flex flex-wrap items-center gap-1.5">
+                <span className="mr-1 text-2xs uppercase tracking-widest text-paper-faint">
+                  Dissenting oracle
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setDissentIndex(null)}
+                  className={`cursor-pointer rounded border px-2 py-1 font-mono text-2xs transition-colors duration-150 ${
+                    dissentIndex === null
+                      ? "border-state-ok/50 bg-state-ok/10 text-state-ok"
+                      : "border-ink-600 text-paper-dim hover:text-paper"
+                  }`}
+                >
+                  none
+                </button>
+                {CONSORTIUM.map((member) => (
+                  <button
+                    key={member.index}
+                    type="button"
+                    onClick={() => setDissentIndex(member.index)}
+                    title={`Simulate ${member.name} submitting false data — the majority outvotes it and its bond is slashed`}
+                    className={`cursor-pointer rounded border px-2 py-1 font-mono text-2xs transition-colors duration-150 ${
+                      dissentIndex === member.index
+                        ? "border-state-fail/50 bg-state-fail/10 text-state-fail"
+                        : "border-ink-600 text-paper-dim hover:text-paper"
+                    }`}
+                  >
+                    {member.name}
+                  </button>
+                ))}
               </div>
 
               <div className="mt-3 grid gap-2 sm:grid-cols-2">

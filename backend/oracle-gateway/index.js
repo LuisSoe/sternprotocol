@@ -29,8 +29,10 @@ app.get("/mock-status/:contractId", (req, res) => {
 
 app.post("/submit-oracle/:contractId", async (req, res, next) => {
   try {
-    const status = getMockStatus(req.params.contractId, req.body || {});
-    const result = await submitOracleVerification(req.params.contractId, status.verification);
+    const body = req.body || {};
+    const status = getMockStatus(req.params.contractId, body);
+    const dissentIndex = Number.isInteger(body.dissentIndex) ? body.dissentIndex : undefined;
+    const result = await submitOracleVerification(req.params.contractId, status.verification, dissentIndex);
     res.json({ status, result });
   } catch (error) {
     next(error);

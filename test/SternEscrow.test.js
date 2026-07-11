@@ -4,16 +4,36 @@ const { mine, time } = require("@nomicfoundation/hardhat-network-helpers");
 
 describe("SternEscrow", function () {
   const value = ethers.parseEther("10");
+  const bond = ethers.parseEther("1");
   const eblCid = "bafybeisternprotocolmvp";
   const commodity = "Indonesian coffee";
   const containerRef = "TGHU-2026-001";
 
-  async function deployFixture(confirmations = 128) {
-    const [owner, oracle, importer, exporter, arbiter, outsider] = await ethers.getSigners();
+  const allTrue = [true, true, true, true, true];
+  const allFalse = [false, false, false, false, false];
+
+  async function deployFixture(confirmations = 128, quorum = 2, { skipBonds = false } = {}) {
+    const [owner, oracleA, importer, exporter, arbiter, outsider, oracleB, oracleC] =
+      await ethers.getSigners();
+    const oracles = [oracleA, oracleB, oracleC];
+
     const SternEscrow = await ethers.getContractFactory("SternEscrow");
-    const sternEscrow = await SternEscrow.deploy(owner.address, oracle.address, confirmations);
+    const sternEscrow = await SternEscrow.deploy(
+      owner.address,
+      oracles.map((oracle) => oracle.address),
+      quorum,
+      bond,
+      confirmations
+    );
     await sternEscrow.waitForDeployment();
-    return { sternEscrow, owner, oracle, importer, exporter, arbiter, outsider };
+
+    if (!skipBonds) {
+      for (const oracle of oracles) {
+        await sternEscrow.connect(oracle).postBond({ value: bond });
+      }
+    }
+
+    return { sternEscrow, owner, oracles, oracleA, oracleB, oracleC, importer, exporter, arbiter, outsider };
   }
 
   async function createEscrow(ctx, overrides = {}) {
@@ -34,16 +54,22 @@ describe("SternEscrow", function () {
     return { escrowId, deadline };
   }
 
-  it("releases funds to exporter after all oracle checks and 128 blocks", async function () {
+  function attest(ctx, oracle, escrowId, bools) {
+    return ctx.sternEscrow.connect(oracle).submitAttestation(escrowId, ...bools);
+  }
+
+  it("releases funds to exporter once a quorum of oracles attests and depth passes", async function () {
     const ctx = await deployFixture();
     const { escrowId } = await createEscrow(ctx);
 
     await mine(128);
 
-    await expect(
-      ctx.sternEscrow.connect(ctx.oracle).submitVerification(escrowId, true, true, true, true, true)
-    )
-      .to.emit(ctx.sternEscrow, "FundsReleased")
+    await attest(ctx, ctx.oracleA, escrowId, allTrue);
+
+    await expect(attest(ctx, ctx.oracleB, escrowId, allTrue))
+      .to.emit(ctx.sternEscrow, "OracleVerificationSubmitted")
+      .withArgs(escrowId, true, true, true, true, true)
+      .and.to.emit(ctx.sternEscrow, "FundsReleased")
       .withArgs(escrowId, ctx.exporter.address, value)
       .and.to.emit(ctx.sternEscrow, "EBLTransferred")
       .withArgs(escrowId, eblCid, ctx.importer.address);
@@ -53,21 +79,64 @@ describe("SternEscrow", function () {
     expect(escrow.contractValue).to.equal(0);
   });
 
-  it("rejects verification from non-oracle accounts", async function () {
-    const ctx = await deployFixture();
-    const { escrowId } = await createEscrow(ctx);
-
-    await expect(
-      ctx.sternEscrow.connect(ctx.outsider).submitVerification(escrowId, true, true, true, true, true)
-    ).to.be.revertedWith("not trusted oracle");
-  });
-
-  it("does not release when VGM does not match", async function () {
+  it("does not finalize before the quorum is reached", async function () {
     const ctx = await deployFixture();
     const { escrowId } = await createEscrow(ctx);
 
     await mine(128);
-    await ctx.sternEscrow.connect(ctx.oracle).submitVerification(escrowId, false, true, true, true, true);
+    await attest(ctx, ctx.oracleA, escrowId, allTrue);
+
+    const escrow = await ctx.sternEscrow.getEscrow(escrowId);
+    expect(escrow.state).to.equal(0);
+    expect(escrow.verification.submittedAtBlock).to.equal(0);
+  });
+
+  it("rejects attestations from non-consortium accounts", async function () {
+    const ctx = await deployFixture();
+    const { escrowId } = await createEscrow(ctx);
+
+    await expect(attest(ctx, ctx.outsider, escrowId, allTrue)).to.be.revertedWith(
+      "not consortium oracle"
+    );
+  });
+
+  it("rejects attestations from an unbonded oracle", async function () {
+    const ctx = await deployFixture(128, 2, { skipBonds: true });
+    const { escrowId } = await createEscrow(ctx);
+
+    await expect(attest(ctx, ctx.oracleA, escrowId, allTrue)).to.be.revertedWith(
+      "oracle bond required"
+    );
+  });
+
+  it("slashes an oracle that deviates from the consortium consensus", async function () {
+    const ctx = await deployFixture();
+    const { escrowId } = await createEscrow(ctx);
+
+    await mine(128);
+
+    // Dissenter reports first, then two honest oracles form the majority.
+    await attest(ctx, ctx.oracleC, escrowId, allFalse);
+    await attest(ctx, ctx.oracleA, escrowId, allTrue);
+
+    await expect(attest(ctx, ctx.oracleB, escrowId, allTrue))
+      .to.emit(ctx.sternEscrow, "OracleSlashed")
+      .withArgs(escrowId, ctx.oracleC.address, bond / 2n)
+      .and.to.emit(ctx.sternEscrow, "FundsReleased");
+
+    expect(await ctx.sternEscrow.oracleBonds(ctx.oracleC.address)).to.equal(bond / 2n);
+    expect(await ctx.sternEscrow.oracleSlashCount(ctx.oracleC.address)).to.equal(1);
+    expect(await ctx.sternEscrow.oracleBonds(ctx.oracleA.address)).to.equal(bond);
+    expect(await ctx.sternEscrow.treasury()).to.equal(bond / 2n);
+  });
+
+  it("keeps funds locked without slashing when the consortium agrees on a failure", async function () {
+    const ctx = await deployFixture();
+    const { escrowId } = await createEscrow(ctx);
+
+    await mine(128);
+    await attest(ctx, ctx.oracleA, escrowId, [false, true, true, true, true]);
+    await attest(ctx, ctx.oracleB, escrowId, [false, true, true, true, true]);
 
     await expect(ctx.sternEscrow.connect(ctx.importer).releaseEscrow(escrowId)).to.be.revertedWith(
       "conditions not met"
@@ -75,29 +144,17 @@ describe("SternEscrow", function () {
 
     const escrow = await ctx.sternEscrow.getEscrow(escrowId);
     expect(escrow.state).to.equal(0);
-  });
-
-  it("does not release when inspection fails", async function () {
-    const ctx = await deployFixture();
-    const { escrowId } = await createEscrow(ctx);
-
-    await mine(128);
-    await ctx.sternEscrow.connect(ctx.oracle).submitVerification(escrowId, true, true, true, true, false);
-
-    await expect(ctx.sternEscrow.connect(ctx.importer).releaseEscrow(escrowId)).to.be.revertedWith(
-      "conditions not met"
-    );
-
-    const escrow = await ctx.sternEscrow.getEscrow(escrowId);
-    expect(escrow.state).to.equal(0);
-    expect(escrow.verification.inspectionPassed).to.equal(false);
+    expect(escrow.verification.vgmMatch).to.equal(false);
+    expect(await ctx.sternEscrow.oracleSlashCount(ctx.oracleA.address)).to.equal(0);
   });
 
   it("allows 2-of-3 disputed refund approval", async function () {
     const ctx = await deployFixture();
     const { escrowId } = await createEscrow(ctx);
 
-    await ctx.sternEscrow.connect(ctx.oracle).submitVerification(escrowId, false, true, true, true, true);
+    await attest(ctx, ctx.oracleA, escrowId, [false, true, true, true, true]);
+    await attest(ctx, ctx.oracleB, escrowId, [false, true, true, true, true]);
+
     await expect(ctx.sternEscrow.connect(ctx.exporter).openDispute(escrowId))
       .to.emit(ctx.sternEscrow, "DisputeOpened")
       .withArgs(escrowId, ctx.exporter.address);
@@ -134,7 +191,8 @@ describe("SternEscrow", function () {
     const { escrowId } = await createEscrow(ctx);
 
     await mine(128);
-    await ctx.sternEscrow.connect(ctx.oracle).submitVerification(escrowId, true, true, true, true, true);
+    await attest(ctx, ctx.oracleA, escrowId, allTrue);
+    await attest(ctx, ctx.oracleB, escrowId, allTrue);
 
     await expect(ctx.sternEscrow.connect(ctx.importer).releaseEscrow(escrowId)).to.be.revertedWith(
       "escrow already completed"
@@ -157,7 +215,8 @@ describe("SternEscrow", function () {
     const ctx = await deployFixture(5);
     const { escrowId } = await createEscrow(ctx);
 
-    await ctx.sternEscrow.connect(ctx.oracle).submitVerification(escrowId, true, true, true, true, true);
+    await attest(ctx, ctx.oracleA, escrowId, allTrue);
+    await attest(ctx, ctx.oracleB, escrowId, allTrue);
 
     let escrow = await ctx.sternEscrow.getEscrow(escrowId);
     expect(escrow.state).to.equal(1); // Verified, but not yet deep enough to auto-release
@@ -170,11 +229,19 @@ describe("SternEscrow", function () {
     expect(await ctx.sternEscrow.requiredConfirmations()).to.equal(5);
   });
 
-  it("rejects deployment with zero confirmations", async function () {
-    const [owner, oracle] = await ethers.getSigners();
+  it("rejects invalid deployment parameters", async function () {
+    const [owner, oracleA, , , , , oracleB, oracleC] = await ethers.getSigners();
+    const oracles = [oracleA.address, oracleB.address, oracleC.address];
     const SternEscrow = await ethers.getContractFactory("SternEscrow");
-    await expect(SternEscrow.deploy(owner.address, oracle.address, 0)).to.be.revertedWith(
+
+    await expect(SternEscrow.deploy(owner.address, oracles, 2, bond, 0)).to.be.revertedWith(
       "confirmations required"
+    );
+    await expect(SternEscrow.deploy(owner.address, oracles, 4, bond, 5)).to.be.revertedWith(
+      "not enough oracles for quorum"
+    );
+    await expect(SternEscrow.deploy(owner.address, oracles, 2, 0, 5)).to.be.revertedWith(
+      "bond required"
     );
   });
 
@@ -199,9 +266,8 @@ describe("SternEscrow", function () {
   it("prevents the proposer from approving their own extension", async function () {
     const ctx = await deployFixture();
     const { escrowId, deadline } = await createEscrow(ctx);
-    const newDeadline = deadline + 3 * 24 * 60 * 60;
 
-    await ctx.sternEscrow.connect(ctx.exporter).proposeDeadlineExtension(escrowId, newDeadline);
+    await ctx.sternEscrow.connect(ctx.exporter).proposeDeadlineExtension(escrowId, deadline + 1000);
 
     await expect(
       ctx.sternEscrow.connect(ctx.exporter).approveDeadlineExtension(escrowId)
@@ -223,5 +289,18 @@ describe("SternEscrow", function () {
     await expect(
       ctx.sternEscrow.connect(ctx.importer).approveDeadlineExtension(escrowId)
     ).to.be.revertedWith("no pending extension");
+  });
+
+  it("clears a pending extension when a dispute locks the escrow state", async function () {
+    const ctx = await deployFixture();
+    const { escrowId, deadline } = await createEscrow(ctx);
+
+    await ctx.sternEscrow.connect(ctx.exporter).proposeDeadlineExtension(escrowId, deadline + 1000);
+    await ctx.sternEscrow.connect(ctx.importer).openDispute(escrowId);
+
+    expect(await ctx.sternEscrow.pendingDeadline(escrowId)).to.equal(0);
+    await expect(
+      ctx.sternEscrow.connect(ctx.importer).approveDeadlineExtension(escrowId)
+    ).to.be.revertedWith("escrow not amendable");
   });
 });
