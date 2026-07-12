@@ -8,6 +8,8 @@ export const sternEscrowAbi = [
   "function getOracles() view returns (address[] addrs, uint256[] bonds, uint256[] slashes)",
   "function getAttestation(uint256 escrowId, address oracle) view returns ((bool submitted,bool vgmMatch,bool aisDeparted,bool ceisaApproved,bool eblCidValid,bool inspectionPassed))",
   "function slashedFor(uint256 escrowId, address oracle) view returns (bool)",
+  "function pendingDeadline(uint256 escrowId) view returns (uint256)",
+  "function extensionProposer(uint256 escrowId) view returns (address)",
   "function createEscrow(address exporterAddress,address arbiterAddress,string eBLCID,uint256 deadline,string commodity,string containerRef) payable returns (uint256)",
   "function releaseEscrow(uint256 escrowId)",
   "function claimRefund(uint256 escrowId)",

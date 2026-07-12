@@ -18,7 +18,7 @@ import { getMockStatus, submitOracle } from "../lib/api.js";
 import { getBrowserContract } from "../lib/contract.js";
 import { CURRENCY_LABEL } from "../lib/currency.js";
 import { CONSORTIUM, ORACLE_QUORUM, defaultConsortium } from "../lib/oracles.js";
-import { shortAddress } from "../lib/actors.js";
+import { actorById, shortAddress } from "../lib/actors.js";
 
 const STATE_LABELS = ["Pending", "Verified", "Completed", "Refunded", "Disputed"];
 
@@ -45,6 +45,7 @@ export default function EscrowDetail({ escrow, role, isOnChainReady, onUpdate, o
   const [extensionInput, setExtensionInput] = useState("");
   const [chainMeta, setChainMeta] = useState(null);
   const [chainOracles, setChainOracles] = useState(null);
+  const [walletAccount, setWalletAccount] = useState(null);
 
   const permissions = PERMISSIONS[role] || PERMISSIONS.importer;
   const isChain = isOnChainReady && escrow.source === "chain";
@@ -72,13 +73,66 @@ export default function EscrowDetail({ escrow, role, isOnChainReady, onUpdate, o
         ]);
         setChainMeta({ confirmations: Number(confirmations), eligible });
         applyChainEscrow(chainEscrow);
-        await loadChainOracles(contract);
+        await Promise.all([loadChainOracles(contract), loadChainExtension(contract, chainEscrow)]);
       } catch {
         setChainMeta(null);
       }
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [escrow.id, isChain]);
+
+  useEffect(() => {
+    if (!isChain || typeof window === "undefined" || !window.ethereum) return;
+    let cancelled = false;
+
+    async function readAccount() {
+      try {
+        const accounts = await window.ethereum.request({ method: "eth_accounts" });
+        if (!cancelled) setWalletAccount(accounts?.[0] || null);
+      } catch {
+        if (!cancelled) setWalletAccount(null);
+      }
+    }
+
+    readAccount();
+    const onAccountsChanged = (accounts) => setWalletAccount(accounts?.[0] || null);
+    window.ethereum.on?.("accountsChanged", onAccountsChanged);
+    return () => {
+      cancelled = true;
+      window.ethereum.removeListener?.("accountsChanged", onAccountsChanged);
+    };
+  }, [isChain]);
+
+  async function loadChainExtension(contract, chainEscrow) {
+    try {
+      const [pending, proposer] = await Promise.all([
+        contract.pendingDeadline(escrow.id),
+        contract.extensionProposer(escrow.id)
+      ]);
+      const pendingMs = Number(pending) * 1000;
+      if (!pendingMs) {
+        onUpdate(escrow.id, (current) => ({ ...current, pendingExtension: null }));
+        return;
+      }
+      const proposerLower = String(proposer).toLowerCase();
+      const label =
+        proposerLower === String(chainEscrow.importerAddress).toLowerCase()
+          ? "importer"
+          : proposerLower === String(chainEscrow.exporterAddress).toLowerCase()
+            ? "exporter"
+            : shortAddress(proposer);
+      onUpdate(escrow.id, (current) => ({
+        ...current,
+        pendingExtension: {
+          proposer: label,
+          proposerAddress: proposer,
+          newDeadline: new Date(pendingMs).toISOString()
+        }
+      }));
+    } catch {
+      // extension views unavailable (old contract) — leave as-is
+    }
+  }
 
   async function loadChainOracles(contract) {
     try {
@@ -136,7 +190,7 @@ export default function EscrowDetail({ escrow, role, isOnChainReady, onUpdate, o
     ]);
     applyChainEscrow(chainEscrow);
     setChainMeta((meta) => (meta ? { ...meta, eligible } : meta));
-    await loadChainOracles(contract);
+    await Promise.all([loadChainOracles(contract), loadChainExtension(contract, chainEscrow)]);
   }
 
   function log(event) {
@@ -166,11 +220,15 @@ export default function EscrowDetail({ escrow, role, isOnChainReady, onUpdate, o
       hint =
         " Funds were already released to the exporter — release also happens automatically inside the oracle's submit once all checks pass and the confirmation depth is reached.";
     } else if (/conditions not met/i.test(reason)) {
-      hint = " All five checks must be attested on-chain and the confirmation depth reached.";
+      hint = " A 2-of-3 oracle consensus must be finalized on-chain and the confirmation depth reached.";
     } else if (/deadline not passed/i.test(reason)) {
       hint = " Refund only opens after the escrow deadline.";
+    } else if (/proposer cannot approve|only importer or exporter|not escrow party|only importer/i.test(reason)) {
+      hint =
+        " The signer is the connected MetaMask account — the sidebar role does NOT change who signs. Switch accounts in MetaMask, then retry.";
     }
-    fail(`${reason}.${hint}`);
+    const signedAs = isChain && walletAccount ? ` (signed as ${shortAddress(walletAccount)})` : "";
+    fail(`${reason}.${hint}${signedAs}`);
   }
 
   function buildOverrides() {
@@ -236,17 +294,30 @@ export default function EscrowDetail({ escrow, role, isOnChainReady, onUpdate, o
         ...(dissentIndex !== null ? { dissentIndex } : {})
       });
       setOracleSources(result.status.sources);
-      onUpdate(escrow.id, (current) => ({ ...current, verification: result.status.verification }));
+      if (!isChain) {
+        onUpdate(escrow.id, (current) => ({ ...current, verification: result.status.verification }));
+      }
       await syncChain();
-      const count = result.result.attestations?.length || 1;
-      if (dissenterName) {
+
+      const submitted = result.result.attestations || [];
+      const count = submitted.length || 1;
+      const noun = count === 1 ? "attestation" : "attestations";
+      const dissentSubmitted = submitted.some((entry) => entry.dissent);
+
+      if (isChain && count < CONSORTIUM.length) {
+        setMessage({
+          tone: "warn",
+          text: `Only ${count} of ${CONSORTIUM.length} consortium ${noun} submitted — the gateway holds ${count} key(s), so the ${ORACLE_QUORUM}-of-${CONSORTIUM.length} quorum cannot finalize. Set ORACLE_PRIVATE_KEYS in .env to all three consortium keys (Hardhat accounts #1, #4, #5 from the deploy output) and restart npm run backend.`
+        });
+        log(`submitted ${count}/${CONSORTIUM.length} oracle ${noun} — gateway keys incomplete, quorum not reached`);
+      } else if (dissentSubmitted && dissenterName) {
         ok(
-          `${count} attestations submitted on-chain. ${dissenterName} deviated from the ${ORACLE_QUORUM}-of-${CONSORTIUM.length} consensus and was slashed 50% of its bond.`
+          `${count} ${noun} submitted on-chain — ${dissenterName} deviated from the ${ORACLE_QUORUM}-of-${CONSORTIUM.length} consensus and its bond was slashed (see consortium panel).`
         );
-        log(`submitted ${count} oracle attestations — ${dissenterName} deviated and was slashed`);
+        log(`submitted ${count} oracle ${noun} — ${dissenterName} deviated and was slashed`);
       } else {
-        ok(`${count} oracle attestations submitted on-chain — consensus recorded (tx ${result.result.transactionHash.slice(0, 10)}…).`);
-        log(`submitted ${count} oracle attestations on-chain`);
+        ok(`${count} oracle ${noun} submitted on-chain — consensus recorded (tx ${result.result.transactionHash.slice(0, 10)}…).`);
+        log(`submitted ${count} oracle ${noun} on-chain`);
       }
     } catch (error) {
       if (isChain) {
@@ -428,6 +499,16 @@ export default function EscrowDetail({ escrow, role, isOnChainReady, onUpdate, o
 
   async function approveExtension() {
     if (isChain) {
+      if (
+        escrow.pendingExtension?.proposerAddress &&
+        walletAccount &&
+        escrow.pendingExtension.proposerAddress.toLowerCase() === walletAccount.toLowerCase()
+      ) {
+        fail(
+          `You proposed this extension — the counterparty must approve it. MetaMask is still on ${shortAddress(walletAccount)}; switch to the other party's account first.`
+        );
+        return;
+      }
       const contract = await getBrowserContract();
       const tx = await contract.approveDeadlineExtension(escrow.id);
       await tx.wait();
@@ -804,7 +885,23 @@ export default function EscrowDetail({ escrow, role, isOnChainReady, onUpdate, o
             </p>
             {isChain ? (
               <p className="pt-1 text-2xs text-paper-faint">
-                Wallet mode: switch MetaMask to the {role} account before acting.
+                MetaMask signs everything — the sidebar role does not.{" "}
+                {walletAccount ? (
+                  <span
+                    className={
+                      walletAccount.toLowerCase() === actorById(role).address.toLowerCase()
+                        ? "text-state-ok"
+                        : "text-state-warn"
+                    }
+                  >
+                    Connected: {shortAddress(walletAccount)}
+                    {walletAccount.toLowerCase() !== actorById(role).address.toLowerCase()
+                      ? ` — differs from the ${role} demo account, switch in MetaMask before acting`
+                      : ` (matches ${role})`}
+                  </span>
+                ) : (
+                  "No account connected."
+                )}
               </p>
             ) : null}
           </div>
