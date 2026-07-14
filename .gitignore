@@ -25,8 +25,8 @@ stern-dashboard.png
 
 # internal working docs — not part of the shipped code
 CLAUDE.md
-DEMO_FILL_EXAMPLE.md
-docs/
+# pitch strategy / judge Q&A prep — stays private until after presenting
+docs/PRODUCT_PLAN.md
 
 .DS_Store
 Thumbs.db
