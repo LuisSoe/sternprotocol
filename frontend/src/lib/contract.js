@@ -1,6 +1,7 @@
 import { ethers } from "ethers";
 
 export const sternEscrowAbi = [
+  "event EscrowCreated(uint256 indexed escrowId, address indexed importer, address indexed exporter, address arbiter, uint256 value, string eBLCID, string commodity, string containerRef, uint256 deadline)",
   "function nextEscrowId() view returns (uint256)",
   "function requiredConfirmations() view returns (uint256)",
   "function isReleaseEligible(uint256 escrowId) view returns (bool)",
