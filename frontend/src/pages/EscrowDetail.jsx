@@ -179,18 +179,20 @@ export default function EscrowDetail({ escrow, role, isOnChainReady, onUpdate, o
             }
           : current.verification
     }));
+    return state;
   }
 
   async function syncChain() {
-    if (!isChain) return;
+    if (!isChain) return null;
     const contract = await getBrowserContract({ requireSigner: false });
     const [chainEscrow, eligible] = await Promise.all([
       contract.getEscrow(escrow.id),
       contract.isReleaseEligible(escrow.id)
     ]);
-    applyChainEscrow(chainEscrow);
+    const state = applyChainEscrow(chainEscrow);
     setChainMeta((meta) => (meta ? { ...meta, eligible } : meta));
     await Promise.all([loadChainOracles(contract), loadChainExtension(contract, chainEscrow)]);
+    return state;
   }
 
   function log(event) {
@@ -297,14 +299,24 @@ export default function EscrowDetail({ escrow, role, isOnChainReady, onUpdate, o
       if (!isChain) {
         onUpdate(escrow.id, (current) => ({ ...current, verification: result.status.verification }));
       }
-      await syncChain();
+      const syncedState = await syncChain();
+      const finalized = syncedState === "Completed" || syncedState === "Refunded";
 
       const submitted = result.result.attestations || [];
-      const count = submitted.length || 1;
+      const rawCount = submitted.length;
+      const count = rawCount || 1;
       const noun = count === 1 ? "attestation" : "attestations";
       const dissentSubmitted = submitted.some((entry) => entry.dissent);
 
-      if (isChain && count < CONSORTIUM.length) {
+      if (isChain && rawCount === 0 && finalized) {
+        ok("Escrow already settled by an earlier attestation — nothing left to submit.");
+        log("checked oracle status — escrow already settled");
+      } else if (isChain && rawCount < CONSORTIUM.length && finalized) {
+        ok(
+          `${rawCount} oracle ${rawCount === 1 ? "attestation" : "attestations"} submitted on-chain — quorum was reached and the escrow settled before the remaining oracle(s) needed to attest (tx ${result.result.transactionHash.slice(0, 10)}…).`
+        );
+        log(`submitted ${rawCount} oracle ${noun} on-chain — quorum finalized early`);
+      } else if (isChain && count < CONSORTIUM.length) {
         setMessage({
           tone: "warn",
           text: `Only ${count} of ${CONSORTIUM.length} consortium ${noun} submitted — the gateway holds ${count} key(s), so the ${ORACLE_QUORUM}-of-${CONSORTIUM.length} quorum cannot finalize. Set ORACLE_PRIVATE_KEYS in .env to all three consortium keys (Hardhat accounts #1, #4, #5 from the deploy output) and restart npm run backend.`
