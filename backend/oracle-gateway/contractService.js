@@ -66,7 +66,19 @@ async function submitOracleVerification(contractId, verification, dissentIndex) 
         ];
 
     const contract = getContract(wallet);
-    const tx = await contract.submitAttestation(contractId, ...vector);
+    let tx;
+    try {
+      tx = await contract.submitAttestation(contractId, ...vector);
+    } catch (error) {
+      const reason = error.reason || error.shortMessage || error.message || "";
+      if (/escrow not verifiable/i.test(reason)) {
+        // Quorum was already reached and the escrow finalized from an earlier
+        // attestation in this same batch (2-of-3 can settle before every
+        // oracle has submitted) — nothing left for the remaining oracles to do.
+        break;
+      }
+      throw error;
+    }
     const receipt = await tx.wait();
     attestations.push({
       oracle: wallet.address,
@@ -75,6 +87,10 @@ async function submitOracleVerification(contractId, verification, dissentIndex) 
       transactionHash: receipt.hash,
       blockNumber: receipt.blockNumber
     });
+  }
+
+  if (attestations.length === 0) {
+    return { transactionHash: null, blockNumber: null, attestations, alreadyFinalized: true };
   }
 
   const last = attestations[attestations.length - 1];
